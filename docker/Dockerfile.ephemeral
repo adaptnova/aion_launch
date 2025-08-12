@@ -1,0 +1,188 @@
+# AION Ultimate Autonomy - Ephemeral GPU Edition
+# Designed for Shadeform disposable GPU instances with Nebius COS persistence
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+LABEL maintainer="AION Team"
+LABEL description="AION Ephemeral - Disposable GPU compute with persistent S3 state"
+LABEL version="2025.08.12"
+
+# Environment setup
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ENV NCCL_NVLS_ENABLE=1
+ENV NCCL_P2P_DISABLE=0
+ENV NCCL_CROSS_NIC=1
+ENV CUDA_DEVICE_MAX_CONNECTIONS=32
+
+# AWS CLI for Nebius COS S3 sync
+ENV AWS_ENDPOINT_URL=https://storage.us-central1.nebius.cloud:443
+ENV AWS_DEFAULT_REGION=us-central1
+
+# System dependencies + AWS CLI
+RUN apt-get update && apt-get install -y \
+    python3.12 \
+    python3.12-venv \
+    python3-pip \
+    build-essential \
+    git \
+    curl \
+    wget \
+    htop \
+    nvtop \
+    redis-server \
+    systemd \
+    sudo \
+    vim \
+    stress-ng \
+    iproute2 \
+    bpftrace \
+    linux-tools-generic \
+    awscli \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create workspace directories
+RUN mkdir -p /opt/aion /workspace/data /workspace/outputs /workspace/checkpoints /aion/logs
+
+# Set up Python virtual environment
+RUN python3.12 -m venv /opt/aion
+ENV PATH="/opt/aion/bin:$PATH"
+
+# Upgrade pip
+RUN /opt/aion/bin/pip install --upgrade pip setuptools wheel
+
+# Copy requirements and install Python packages
+COPY requirements.txt /tmp/
+RUN /opt/aion/bin/pip install -r /tmp/requirements.txt
+
+# Install additional GPU-optimized packages
+RUN /opt/aion/bin/pip install \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 \
+    flash-attn \
+    triton \
+    apex
+
+# Copy AION source code
+COPY src/ /opt/aion/
+COPY scripts/ /opt/aion/scripts/
+COPY config/ /opt/aion/config/
+
+# Create entrypoint script for S3 sync
+RUN cat > /opt/aion/entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "🚀 AION Ephemeral GPU Instance Starting..."
+echo "📦 Instance ID: ${INSTANCE_ID:-unknown}"
+echo "🔧 GPU Count: $(nvidia-smi -L | wc -l)"
+echo "💾 S3 Bucket: ${S3_BUCKET}/${S3_PREFIX}"
+
+# Function to sync from S3
+sync_from_s3() {
+    echo "⬇️  Syncing data from Nebius COS..."
+    aws s3 sync "s3://${S3_BUCKET}/${S3_PREFIX}" "/workspace/data" \
+        --endpoint-url "${AWS_ENDPOINT_URL}" \
+        --no-progress || echo "Warning: Initial sync failed (might be first run)"
+    
+    # Sync any existing checkpoints
+    aws s3 sync "s3://${S3_BUCKET}/${S3_PREFIX}checkpoints/" "/workspace/checkpoints" \
+        --endpoint-url "${AWS_ENDPOINT_URL}" \
+        --no-progress || true
+}
+
+# Function to sync to S3
+sync_to_s3() {
+    echo "⬆️  Syncing outputs to Nebius COS..."
+    
+    # Create run metadata
+    RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+    echo "{
+        \"run_id\": \"${RUN_ID}\",
+        \"instance_id\": \"${INSTANCE_ID}\",
+        \"timestamp\": \"$(date -Iseconds)\",
+        \"gpu_count\": $(nvidia-smi -L | wc -l),
+        \"git_sha\": \"${GIT_SHA:-unknown}\"
+    }" > /workspace/outputs/run_metadata.json
+    
+    # Sync outputs with timestamp prefix
+    aws s3 sync "/workspace/outputs" "s3://${S3_BUCKET}/${S3_PREFIX}outputs/${RUN_ID}/" \
+        --endpoint-url "${AWS_ENDPOINT_URL}" \
+        --exact-timestamps
+    
+    # Sync checkpoints
+    aws s3 sync "/workspace/checkpoints" "s3://${S3_BUCKET}/${S3_PREFIX}checkpoints/" \
+        --endpoint-url "${AWS_ENDPOINT_URL}" \
+        --exact-timestamps
+    
+    # Sync logs
+    aws s3 sync "/aion/logs" "s3://${S3_BUCKET}/${S3_PREFIX}logs/${RUN_ID}/" \
+        --endpoint-url "${AWS_ENDPOINT_URL}"
+}
+
+# Function to self-destruct instance
+self_destruct() {
+    if [ -n "${SHADEFORM_API_KEY}" ] && [ -n "${INSTANCE_ID}" ]; then
+        echo "🗑️  Self-destructing instance ${INSTANCE_ID}..."
+        curl --request POST "https://api.shadeform.ai/v1/instances/${INSTANCE_ID}/delete" \
+            -H "X-API-KEY: ${SHADEFORM_API_KEY}" \
+            -H "Content-Type: application/json" || echo "Warning: Self-destruct failed"
+    fi
+}
+
+# Trap for cleanup on exit
+cleanup() {
+    echo "🧹 Cleaning up..."
+    sync_to_s3
+    
+    # Optional: self-destruct on successful completion
+    if [ "$1" = "0" ] && [ "${AUTO_DELETE}" = "true" ]; then
+        self_destruct
+    fi
+}
+trap 'cleanup $?' EXIT
+
+# Initial sync from S3
+sync_from_s3
+
+# Start Redis in background
+redis-server --port 18000 --bind 127.0.0.1 --daemonize yes
+
+# Wait for Redis
+sleep 2
+
+# Start AION with full autonomy
+echo "🔥 Starting AION with FULL AUTONOMY (NO BRAKES MODE)..."
+cd /opt/aion
+
+# Export workspace for AION to use
+export AION_WORKSPACE=/workspace
+export AION_OUTPUT_DIR=/workspace/outputs
+export AION_CHECKPOINT_DIR=/workspace/checkpoints
+
+# If custom command provided, run it; otherwise start AION
+if [ -n "$1" ]; then
+    echo "🎯 Running custom command: $@"
+    exec "$@"
+else
+    echo "🤖 Starting AION Autonomy System..."
+    exec /opt/aion/bin/python /opt/aion/full_autonomy_toolbelt.py
+fi
+EOF
+RUN chmod +x /opt/aion/entrypoint.sh
+
+# Expose ports
+EXPOSE 30001 18000
+
+# Volume mounts (configured by Shadeform)
+VOLUME ["/workspace", "/aion/logs"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:30001/health || exit 1
+
+# Set working directory
+WORKDIR /opt/aion
+
+# Entry point with S3 sync
+ENTRYPOINT ["/opt/aion/entrypoint.sh"]

@@ -1,0 +1,103 @@
+version: '3.8'
+
+services:
+  aion:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ephemeral
+    image: ${DOCKERHUB_USERNAME}/aion-ephemeral:latest
+    container_name: aion-autonomy
+    restart: unless-stopped
+    
+    # Full GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Privileged for full system access (NO BRAKES)
+    privileged: true
+    network_mode: host
+    pid: host
+    
+    environment:
+      # S3 Configuration
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_PREFIX=${S3_PREFIX}
+      
+      # AION Configuration
+      - AION_MODE=${AION_MODE:-FULL_AUTONOMY}
+      - AION_TRUST_LEVEL=${AION_TRUST_LEVEL:-COMPLETE}
+      - AION_RESTRICTIONS=${AION_RESTRICTIONS:-NONE}
+      
+      # GPU Configuration
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+      - NCCL_NVLS_ENABLE=1
+      - NCCL_P2P_DISABLE=0
+      
+      # Instance Management
+      - INSTANCE_ID=${INSTANCE_ID}
+      - SHADEFORM_API_KEY=${SHADEFORM_API_KEY}
+      - AUTO_DELETE=${AUTO_DELETE:-false}
+      - GIT_SHA=${GIT_SHA}
+    
+    volumes:
+      # Persistent workspace
+      - workspace:/workspace
+      - logs:/aion/logs
+      
+      # Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock
+      
+      # System access (FULL AUTONOMY)
+      - /:/host:ro
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+    
+    ports:
+      - "30001:30001"  # AION API
+      - "18000:18000"  # Redis
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  # Optional: Redis for external access
+  redis:
+    image: redis:7-alpine
+    container_name: aion-redis
+    restart: unless-stopped
+    command: redis-server --port 18000 --bind 0.0.0.0
+    ports:
+      - "18000:18000"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  workspace:
+    driver: local
+  logs:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: aion-network
+    driver: bridge

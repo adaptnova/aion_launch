@@ -1,0 +1,42 @@
+[Unit]
+Description=AION Autonomous Co-Creator System
+Documentation=https://github.com/aion/autonomy
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shadeform
+Group=shadeform
+WorkingDirectory=/opt/aion
+Environment="PATH=/opt/aion/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONPATH=/opt/aion:/opt/aion/lib/python3.12/site-packages"
+Environment="AION_MODE=AUTONOMOUS"
+
+# Main execution command
+ExecStart=/opt/aion/bin/python /opt/aion/full_autonomy_toolbelt.py
+
+# Restart policy - always restart unless explicitly stopped
+Restart=always
+RestartSec=10
+StartLimitInterval=600
+StartLimitBurst=5
+
+# Resource limits (generous for AI workloads)
+LimitNOFILE=65536
+LimitNPROC=32768
+LimitCORE=infinity
+TasksMax=infinity
+
+# Logging
+StandardOutput=append:/aion/logs/autonomy.log
+StandardError=append:/aion/logs/autonomy_error.log
+
+# Security (minimal restrictions for full autonomy)
+PrivateTmp=false
+ProtectSystem=false
+ProtectHome=false
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
